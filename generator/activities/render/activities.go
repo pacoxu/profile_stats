@@ -64,6 +64,8 @@ func ActivitiesRender(w io.Writer, data ActivitiesData) error {
 	}
 	table := tablewriter.NewWriter(w)
 	table.SetAutoFormatHeaders(false)
+	table.SetAutoWrapText(false)
+	table.SetColWidth(500)
 	table.SetHeader([]string{"Title", "Branch", "State", "Username", "Change Size/Commits/File", "Labels"})
 	table.SetBorders(tablewriter.Border{Left: true, Top: false, Right: true, Bottom: false})
 	table.SetCenterSeparator("|")
