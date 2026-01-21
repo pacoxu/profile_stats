@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/wzshiming/profile_stats"
@@ -44,8 +45,10 @@ func (r *Handler) register(name string, generator profile_stats.Generator) {
 }
 
 func (r *Handler) Handle(ctx context.Context, origin []byte) ([]byte, []string, error) {
+	handleStart := time.Now()
 	buf := bytes.NewBuffer(nil)
 	var warnings []string
+	var generatorCount int
 	date, err := xmlinjector.Inject([]byte(key), origin, func(args, origin []byte) []byte {
 		tag := NewArgs(string(args), true)
 		template, ok := tag.String("template")
@@ -64,12 +67,20 @@ func (r *Handler) Handle(ctx context.Context, origin []byte) ([]byte, []string, 
 			warnings = append(warnings, fmt.Sprintf("%q: not support template %q", args, template))
 			return errInfo(fmt.Sprintf("not support template %q", template), origin)
 		}
+
+		generatorCount++
+		genStart := time.Now()
 		buf.Reset()
 		err := generator.Generate(ctx, buf, tag)
+		genDuration := time.Since(genStart)
 		if err != nil {
+			log.Printf("[generator:%s] failed in %v: %v", template, genDuration, err)
 			warnings = append(warnings, fmt.Sprintf("%q: %s", args, err.Error()))
 			return errInfo(err.Error(), origin)
 		}
+
+		outputSize := buf.Len()
+		log.Printf("[generator:%s] completed in %v (output: %d bytes)", template, genDuration, outputSize)
 
 		raw := buf.Bytes()
 		raw = bytes.Trim(raw, blankChar)
@@ -88,6 +99,10 @@ func (r *Handler) Handle(ctx context.Context, origin []byte) ([]byte, []string, 
 		}
 		return tmp
 	})
+	handleDuration := time.Since(handleStart)
+	if generatorCount > 0 {
+		log.Printf("[handler] completed in %v (processed %d generator(s))", handleDuration, generatorCount)
+	}
 	return date, warnings, err
 }
 

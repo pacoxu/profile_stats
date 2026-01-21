@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -62,6 +63,9 @@ func (l *intervalRequest) RoundTrip(r *http.Request) (*http.Response, error) {
 	now := time.Now()
 	sub := now.Sub(l.last)
 	if s := l.interval - sub; s > 0 {
+		if s > time.Second {
+			log.Printf("[intervalRequest] waiting %v before request to %s", s, r.URL.Path)
+		}
 		time.Sleep(s)
 	}
 	tmpBody := bytes.NewBuffer(make([]byte, 0, r.ContentLength))
@@ -145,6 +149,7 @@ type Source struct {
 }
 
 func (s *Source) Stat(ctx context.Context, username string) (*Stat, error) {
+	start := time.Now()
 	var query struct {
 		User struct {
 			Repositories struct {
@@ -173,9 +178,12 @@ func (s *Source) Stat(ctx context.Context, username string) (*Stat, error) {
 	}
 
 	err := s.cliv4.Query(ctx, &query, variables)
+	queryDuration := time.Since(start)
 	if err != nil {
+		log.Printf("[source:Stat] query failed for %q after %v: %v", username, queryDuration, err)
 		return nil, err
 	}
+	log.Printf("[source:Stat] query completed for %q in %v (repos: %d)", username, queryDuration, len(query.User.Repositories.Nodes))
 	stat := Stat{}
 	stat.Name = string(query.User.Name)
 	for _, repo := range query.User.Repositories.Nodes {
@@ -194,11 +202,16 @@ func (s *Source) Stat(ctx context.Context, username string) (*Stat, error) {
 }
 
 func (s *Source) OrgStat(ctx context.Context, username string, org string) (*OrgStat, error) {
+	start := time.Now()
 	// Can't got Organization ID in API v4
+	orgStart := time.Now()
 	o, _, err := s.cliv3.Organizations.Get(ctx, org)
 	if err != nil {
+		log.Printf("[source:OrgStat] get org %q failed for %q after %v: %v", org, username, time.Since(orgStart), err)
 		return nil, err
 	}
+	log.Printf("[source:OrgStat] get org %q completed in %v", org, time.Since(orgStart))
+	
 	var query struct {
 		User struct {
 			Contributions struct {
@@ -217,10 +230,13 @@ func (s *Source) OrgStat(ctx context.Context, username string, org string) (*Org
 		"username": ghv4.String(username),
 	}
 
+	queryStart := time.Now()
 	err = s.cliv4.Query(ctx, &query, variables)
 	if err != nil {
+		log.Printf("[source:OrgStat] query failed for %q/%q after %v: %v", username, org, time.Since(queryStart), err)
 		return nil, err
 	}
+	log.Printf("[source:OrgStat] completed for %q/%q in %v (query: %v)", username, org, time.Since(start), time.Since(queryStart))
 
 	stat := OrgStat{}
 	stat.LogoURL = *o.AvatarURL
@@ -233,13 +249,17 @@ func (s *Source) OrgStat(ctx context.Context, username string, org string) (*Org
 }
 
 func (s *Source) CommitCounter(ctx context.Context, username string) (int, error) {
+	start := time.Now()
 	result, _, err := s.cliv3.Search.Commits(ctx, fmt.Sprintf("author:%q", username), &ghv3.SearchOptions{
 		ListOptions: ghv3.ListOptions{PerPage: 1},
 	})
 	if err != nil {
+		log.Printf("[source:CommitCounter] search failed for %q after %v: %v", username, time.Since(start), err)
 		return 0, err
 	}
-	return *result.Total, nil
+	total := *result.Total
+	log.Printf("[source:CommitCounter] completed for %q in %v (total: %d)", username, time.Since(start), total)
+	return total, nil
 }
 
 type PullRequest struct {
@@ -264,6 +284,7 @@ type PullRequest struct {
 type PullRequestCallback func(pr *PullRequest) bool
 
 func (s *Source) PullRequests(ctx context.Context, username string, states []PullRequestState, orderField IssueOrderField, orderDirection OrderDirection, size int, cbs ...PullRequestCallback) ([]*PullRequest, error) {
+	start := time.Now()
 	var pageSize = MaxPageSize
 	if size >= 0 && pageSize > size {
 		pageSize = size
@@ -385,8 +406,11 @@ func (s *Source) PullRequests(ctx context.Context, username string, states []Pul
 		"after":    (*ghv4.String)(nil),
 		"orderBy":  orderBy,
 	}
+	pageStart := time.Now()
 	err := s.cliv4.Query(ctx, &query, variables)
+	pageDuration := time.Since(pageStart)
 	if err != nil {
+		log.Printf("[source:PullRequests] first page query failed for %q after %v: %v", username, pageDuration, err)
 		return nil, err
 	}
 
@@ -394,20 +418,24 @@ func (s *Source) PullRequests(ctx context.Context, username string, states []Pul
 	next := bool(query.User.PullRequests.PageInfo.HasNextPage)
 	cursor := string(query.User.PullRequests.PageInfo.EndCursor)
 	prs := make([]*PullRequest, 0, count)
+	pageNum := 1
 	for _, r := range query.User.PullRequests.Nodes {
 		pr := conv(&r)
 		if len(cbs) != 0 {
 			for _, cb := range cbs {
 				if !cb(pr) {
+					log.Printf("[source:PullRequests] fetched %d PRs for %q in %v (page %d, stopped by callback)", len(prs), username, time.Since(start), pageNum)
 					return prs, nil
 				}
 			}
 		}
 		prs = append(prs, pr)
 	}
+	log.Printf("[source:PullRequests] page %d completed for %q in %v (total: %d, fetched: %d, hasNext: %v)", pageNum, username, pageDuration, count, len(prs), next)
 
 	for next && cursor != "" &&
 		(size < 0 || len(prs) < size) {
+		pageNum++
 		pageSize := pageSize
 		if size >= 0 && pageSize+len(prs) > size {
 			pageSize = size - len(prs)
@@ -419,8 +447,11 @@ func (s *Source) PullRequests(ctx context.Context, username string, states []Pul
 			"after":    ghv4.String(cursor),
 			"orderBy":  orderBy,
 		}
+		pageStart := time.Now()
 		err := s.cliv4.Query(ctx, &query, variables)
+		pageDuration := time.Since(pageStart)
 		if err != nil {
+			log.Printf("[source:PullRequests] page %d query failed for %q after %v: %v", pageNum, username, pageDuration, err)
 			return nil, err
 		}
 		for _, r := range query.User.PullRequests.Nodes {
@@ -428,15 +459,18 @@ func (s *Source) PullRequests(ctx context.Context, username string, states []Pul
 			if len(cbs) != 0 {
 				for _, cb := range cbs {
 					if !cb(pr) {
+						log.Printf("[source:PullRequests] fetched %d PRs for %q in %v (page %d, stopped by callback)", len(prs), username, time.Since(start), pageNum)
 						return prs, nil
 					}
 				}
 			}
 			prs = append(prs, pr)
 		}
+		log.Printf("[source:PullRequests] page %d completed for %q in %v (fetched: %d, hasNext: %v)", pageNum, username, pageDuration, len(prs), next)
 		next = bool(query.User.PullRequests.PageInfo.HasNextPage)
 		cursor = string(query.User.PullRequests.PageInfo.EndCursor)
 	}
+	log.Printf("[source:PullRequests] completed for %q in %v (total pages: %d, fetched: %d PRs)", username, time.Since(start), pageNum, len(prs))
 	return prs, nil
 }
 
